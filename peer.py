@@ -95,6 +95,7 @@ class Peer:
         logging.debug(f"Peer started on {self.host}:{self.port}")
 
         threading.Thread(target=self.gossip, daemon=True).start()
+        threading.Thread(target=self.start_health_check, daemon=True).start()
 
         while True:
             client, addr = server.accept()
@@ -106,12 +107,12 @@ class Peer:
                 data = client.recv(1024).decode("utf-8")
                 if not data:
                     break
-                self.process_message(data)
+                self.process_message(data, client)
 
             except ConnectionResetError:
                 break
 
-    def process_message(self, data: str):
+    def process_message(self, data: str, client: Optional[socket.socket]):
         try:
             message: dict = json.loads(data)
 
@@ -124,6 +125,14 @@ class Peer:
             elif message["type"] == "from_genesis":
                 for peer_addr in message["peers"]:
                     self.peer_manager.add_peer(peer_addr)
+
+            elif message["type"] == "health_check":
+                peer_addr = message["address"]
+                logging.debug(f"Received health check from {peer_addr[0]}:{peer_addr[1]}")
+                self.peer_manager.add_peer(peer_addr)
+
+                message = {"type": "health_check_response", "status": "healthy"}
+                client.sendall(json.dumps(message).encode())
 
         except Exception as e:
             logging.critical(f"Error processing message: {e}")
@@ -142,15 +151,15 @@ class Peer:
     def connect_to_genesis(self):
         try:
             with socket.create_connection((GENESIS_IP, GENESIS_PORT), timeout=60) as server:
-                message = {"type": "request_peers", "address": [server.getsockname()[0], self.port]}
+                message = {"type": "request_peers", "address": [self.host, self.port]}
 
-                logging.debug(f"Sending to genesis: {json.dumps(message).encode()}")
+                logging.debug(f"Sending to genesis: {json.dumps(message)}")
                 server.sendall(json.dumps(message).encode())
 
                 response = server.recv(1024).decode('utf-8')
                 logging.debug(f"Received from genesis: {response}")
 
-                self.process_message(response)
+                self.process_message(response, None)
 
         except Exception as e:
             logging.critical(f"Failed to connect to genesis node: {e}")
@@ -161,13 +170,45 @@ class Peer:
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server.connect((peer_addr[0], peer_addr[1]))
             peers = self.peer_manager.get_peers(2, peer_addr)
-            message = {"type": "send_peers", "peers": peers, "address": [server.getsockname()[0], self.port]}
+            message = {"type": "send_peers", "peers": peers, "address": [self.host, self.port]}
 
             logging.debug(f"Sending to peer {peer_addr[0]}:{peer_addr[1]}: {message}")
             server.sendall(json.dumps(message).encode())
 
         except Exception as e:
             logging.critical(f"Error gossiping with peer {peer_addr}: {e}")
+
+    def start_health_check(self):
+        logging.debug("Starting health check")
+        while True:
+            self.health_check()
+            time.sleep(30)
+
+    def health_check(self):
+        logging.debug(f"Performing health check")
+        try:
+            for peer_addr in self.peer_manager.get_all_peers():
+                try:
+                    with socket.create_connection(peer_addr, timeout=20) as server:
+                        message = {"type": "health_check", "address": [self.host, self.port]}
+                        server.sendall(json.dumps(message).encode())
+
+                        logging.debug(f"SENDING TO {peer_addr} HEALTH CHECK")
+                        response = server.recv(1024).decode('utf-8')
+                        health_response: dict = json.loads(response)
+                        if health_response["type"] == "health_check_response" and health_response["status"] == "healthy":
+                            logging.debug(f"Received healthy status from {peer_addr[0]}:{peer_addr[1]}")
+                            continue
+
+                        logging.warning(f"Didn't receive a healthy check response from {peer_addr[0]}:{peer_addr[1]}")
+                        raise Exception("No response from peer")
+
+                except (socket.timeout, ConnectionRefusedError, OSError) as e:
+                    logging.warning(f"Peer {peer_addr[0]}:{peer_addr[1]} is offline. Removing from database. Error: {e}")
+                    self.peer_manager.remove_peer(peer_addr)
+
+        except Exception as e:
+            logging.critical(f"Failed to perform health check: {e}")
 
 
 class PeerManager:
@@ -198,7 +239,7 @@ class PeerManager:
             with self.conn:
                 cursor = self.conn.execute("INSERT OR IGNORE INTO peer (ip, port) VALUES (?, ?)", peer_addr)
                 if cursor.rowcount > 0:
-                    logging.debug(f"Peer {peer_addr[0]}:{peer_addr[1]} was inserted successfully to the database")
+                    logging.debug(f"Peer {peer_addr[0]}:{peer_addr[1]} got inserted successfully to the database")
 
         except sqlite3.Error as e:
             logging.critical(f"Error adding peer: {e}")
@@ -209,3 +250,13 @@ class PeerManager:
             user_ip, user_port = user_addr or ("", 0)
             result = self.conn.execute(query, (user_ip, user_port, count)).fetchall()
             return result
+
+    def get_all_peers(self) -> list[tuple[str, int]]:
+        with self.conn:
+            return self.conn.execute("SELECT ip, port FROM peer").fetchall()
+
+    def remove_peer(self, peer: tuple[str, int]):
+        with self.conn:
+            cursor = self.conn.execute("DELETE FROM peer WHERE ip=? and port=?", (peer[0], peer[1]))
+            if cursor.rowcount > 0:
+                logging.debug(f"Peer {peer[0]}:{peer[1]} got removed successfully from the database")
