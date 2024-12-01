@@ -37,6 +37,7 @@ class Genesis:
         server.listen()
 
         logging.debug(f"Genesis server started on {self.host}:{self.port}")
+        threading.Thread(target=self.start_health_check, daemon=True).start()
 
         while True:
             client, addr = server.accept()
@@ -79,6 +80,38 @@ class Genesis:
 
         except Exception as e:
             logging.critical(f"Error processing message: {e}")
+
+    def start_health_check(self):
+        logging.debug("Starting health check")
+        while True:
+            self.health_check()
+            time.sleep(30)
+
+    def health_check(self):
+        logging.debug(f"Performing health check")
+        try:
+            for peer_addr in self.peer_manager.get_all_peers():
+                try:
+                    with socket.create_connection(peer_addr, timeout=20) as server:
+                        message = {"type": "genesis_health_check"}
+                        server.sendall(json.dumps(message).encode())
+
+                        logging.debug(f"SENDING TO {peer_addr} HEALTH CHECK")
+                        response = server.recv(1024).decode('utf-8')
+                        health_response: dict = json.loads(response)
+                        if health_response["type"] == "genesis_health_check_response" and health_response["status"] == "healthy":
+                            logging.debug(f"Received healthy status from {peer_addr[0]}:{peer_addr[1]}")
+                            continue
+
+                        logging.warning(f"Didn't receive a healthy check response from {peer_addr[0]}:{peer_addr[1]}")
+                        raise Exception("No response from peer")
+
+                except (socket.timeout, ConnectionRefusedError, OSError) as e:
+                    logging.warning(f"Peer {peer_addr[0]}:{peer_addr[1]} is offline. Removing from database. Error: {e}")
+                    self.peer_manager.remove_peer(peer_addr)
+
+        except Exception as e:
+            logging.critical(f"Failed to perform health check: {e}")
 
 
 class Peer:
@@ -134,6 +167,11 @@ class Peer:
                 message = {"type": "health_check_response", "status": "healthy"}
                 client.sendall(json.dumps(message).encode())
 
+            elif message["type"] == "genesis_health_check":
+                logging.debug(f"Received health check from genesis")
+                message = {"type": "genesis_health_check_response", "status": "healthy"}
+                client.sendall(json.dumps(message).encode())
+
         except Exception as e:
             logging.critical(f"Error processing message: {e}")
 
@@ -165,7 +203,7 @@ class Peer:
             logging.critical(f"Failed to connect to genesis node: {e}")
 
     def gossip_with_peer(self, peer_addr: tuple[str, int]):
-        logging.debug(f"Started gossipping with peer: {peer_addr[0]}:{peer_addr[1]}")
+        logging.debug(f"Started gossiping with peer: {peer_addr[0]}:{peer_addr[1]}")
         try:
             server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server.connect((peer_addr[0], peer_addr[1]))
@@ -176,7 +214,8 @@ class Peer:
             server.sendall(json.dumps(message).encode())
 
         except Exception as e:
-            logging.critical(f"Error gossiping with peer {peer_addr}: {e}")
+            logging.warning(f"Error gossiping with peer {peer_addr}: {e}")
+            self.peer_manager.remove_peer(peer_addr)
 
     def start_health_check(self):
         logging.debug("Starting health check")
