@@ -1,8 +1,8 @@
-from peer import Peer
+from peer import Node
 
 
 def main():
-    peer = Peer()
+    peer = Node(8082)
     peer.start()
 
 

@@ -20,14 +20,10 @@ GENESIS_IP = "localhost"
 
 GOSSIP_COUNT = 2
 GOSSIP_RATE = 15
-MAX_PEERS = 10
 
 
-class Genesis:
-    GOSSIP_COUNT = 3
-    RETRY_DELAY = 5
-
-    def __init__(self, port=GENESIS_PORT):
+class BaseNode:
+    def __init__(self, port):
         self.port = port
         self.host = "localhost"
         self.peer_manager = PeerManager()
@@ -37,12 +33,26 @@ class Genesis:
         server.bind((self.host, self.port))
         server.listen()
 
-        logging.debug(f"Genesis server started on {self.host}:{self.port}")
+        logging.debug(f"Node started on {self.host}:{self.port}")
         threading.Thread(target=self.start_health_check, daemon=True).start()
+        self.start_extra_threads()
 
         while True:
             client, addr = server.accept()
             threading.Thread(target=self.handle_client, args=(client,)).start()
+
+    def start_extra_threads(self):
+        pass
+
+    def start_health_check(self):
+        logging.debug("Starting health check")
+        while True:
+            for peer in self.peer_manager.get_all_peers():
+                self.perform_health_check()
+            time.sleep(30)
+
+    def perform_health_check(self):
+        raise NotImplementedError
 
     def handle_client(self, client: socket.socket):
         while True:
@@ -56,13 +66,23 @@ class Genesis:
                 break
 
     def process_message(self, data: str, client: socket.socket):
+        raise NotImplementedError
+
+
+class BootstrapNode(BaseNode):
+    GOSSIP_COUNT = 3
+
+    def __init__(self, port=GENESIS_PORT):
+        super().__init__(port)
+
+    def process_message(self, data: str, client: socket.socket):
         try:
             message: dict = json.loads(data)
 
             if message["type"] == "request_peers":
                 peer_addr = message["address"]
 
-                self.peer_manager.add_peer(peer_addr)
+                self.peer_manager.add_peer(peer_addr, None)
 
                 peers = self.peer_manager.get_peers(self.GOSSIP_COUNT, peer_addr)
 
@@ -82,13 +102,7 @@ class Genesis:
         except Exception as e:
             logging.critical(f"Error processing message: {e}")
 
-    def start_health_check(self):
-        logging.debug("Starting health check")
-        while True:
-            self.health_check()
-            time.sleep(30)
-
-    def health_check(self):
+    def perform_health_check(self):
         logging.debug(f"Performing health check")
         try:
             for peer_addr in self.peer_manager.get_all_peers():
@@ -116,36 +130,11 @@ class Genesis:
             logging.critical(f"Failed to perform health check: {e}")
 
 
-class Peer:
+class Node(BaseNode):
+    MAX_PEERS = 10
+
     def __init__(self, port):
-        self.port = port
-        self.host = "localhost"
-        self.peer_manager = PeerManager()
-
-    def start(self):
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.bind((self.host, self.port))
-        server.listen()
-
-        logging.debug(f"Peer started on {self.host}:{self.port}")
-
-        threading.Thread(target=self.gossip, daemon=True).start()
-        threading.Thread(target=self.start_health_check, daemon=True).start()
-
-        while True:
-            client, addr = server.accept()
-            threading.Thread(target=self.handle_client, args=(client,)).start()
-
-    def handle_client(self, client: socket.socket):
-        while True:
-            try:
-                data = client.recv(1024).decode("utf-8")
-                if not data:
-                    break
-                self.process_message(data, client)
-
-            except ConnectionResetError:
-                break
+        super().__init__(port)
 
     def process_message(self, data: str, client: Optional[socket.socket]):
         try:
@@ -153,18 +142,18 @@ class Peer:
 
             if message["type"] == "send_peers":
                 peer_addr_from_sender = message["address"]
-                self.peer_manager.add_peer(peer_addr_from_sender)
+                self.peer_manager.add_peer(peer_addr_from_sender, self.MAX_PEERS)
                 for peer_addr in message["peers"]:
-                    self.peer_manager.add_peer(peer_addr)
+                    self.peer_manager.add_peer(peer_addr, self.MAX_PEERS)
 
             elif message["type"] == "from_genesis":
                 for peer_addr in message["peers"]:
-                    self.peer_manager.add_peer(peer_addr)
+                    self.peer_manager.add_peer(peer_addr, self.MAX_PEERS)
 
             elif message["type"] == "health_check":
                 peer_addr = message["address"]
                 logging.debug(f"Received health check from {peer_addr[0]}:{peer_addr[1]}")
-                self.peer_manager.add_peer(peer_addr)
+                self.peer_manager.add_peer(peer_addr, self.MAX_PEERS)
 
                 message = {"type": "health_check_response", "status": "healthy"}
                 client.sendall(json.dumps(message).encode())
@@ -176,6 +165,10 @@ class Peer:
 
         except Exception as e:
             logging.critical(f"Error processing message: {e}")
+
+    def start_extra_threads(self):
+        print("hallo")
+        threading.Thread(target=self.gossip, daemon=True).start()
 
     def gossip(self):
         while True:
@@ -219,13 +212,7 @@ class Peer:
             logging.warning(f"Error gossiping with peer {peer_addr}: {e}")
             self.peer_manager.remove_peer(peer_addr)
 
-    def start_health_check(self):
-        logging.debug("Starting health check")
-        while True:
-            self.health_check()
-            time.sleep(30)
-
-    def health_check(self):
+    def perform_health_check(self):
         logging.debug(f"Performing health check")
         try:
             for peer_addr in self.peer_manager.get_all_peers():
@@ -284,9 +271,9 @@ class PeerManager:
         with self.conn:
             self.conn.execute("UPDATE peer SET is_offline=TRUE where ip=? and port=?", peer_addr)
 
-    def add_peer(self, peer_addr: tuple[str, int]):
-        if self.get_rows() > MAX_PEERS:
-            logging.debug(f"Already {MAX_PEERS} in database. Not inserting {peer_addr[0]}:{peer_addr[1]}")
+    def add_peer(self, peer_addr: tuple[str, int], max_peers: Optional[int]):
+        if max_peers and self.get_rows() > max_peers:
+            logging.debug(f"Already {max_peers} in database. Not inserting {peer_addr[0]}:{peer_addr[1]}")
             return
 
         try:
