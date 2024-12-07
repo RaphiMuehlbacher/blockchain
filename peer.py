@@ -20,6 +20,7 @@ GENESIS_IP = "localhost"
 
 GOSSIP_COUNT = 2
 GOSSIP_RATE = 15
+MAX_PEERS = 10
 
 
 class Genesis:
@@ -101,14 +102,15 @@ class Genesis:
                         health_response: dict = json.loads(response)
                         if health_response["type"] == "genesis_health_check_response" and health_response["status"] == "healthy":
                             logging.debug(f"Received healthy status from {peer_addr[0]}:{peer_addr[1]}")
+                            self.peer_manager.set_online(peer_addr)
                             continue
 
                         logging.warning(f"Didn't receive a healthy check response from {peer_addr[0]}:{peer_addr[1]}")
                         raise Exception("No response from peer")
 
                 except (socket.timeout, ConnectionRefusedError, OSError) as e:
-                    logging.warning(f"Peer {peer_addr[0]}:{peer_addr[1]} is offline. Removing from database. Error: {e}")
-                    self.peer_manager.remove_peer(peer_addr)
+                    logging.warning(f"Peer {peer_addr[0]}:{peer_addr[1]} is offline. Setting to offline. Error: {e}")
+                    self.peer_manager.set_offline(peer_addr)
 
         except Exception as e:
             logging.critical(f"Failed to perform health check: {e}")
@@ -269,11 +271,24 @@ class PeerManager:
                 id INTEGER PRIMARY KEY autoincrement,
                 ip TEXT NOT NULL,
                 port INTEGER NOT NULL,
+                is_offline BOOLEAN DEFAULT FALSE,
                 UNIQUE(ip, port)
             )
             """)
 
+    def set_online(self, peer_addr: tuple[str, int]):
+        with self.conn:
+            self.conn.execute("UPDATE peer SET is_offline=FALSE where ip=? and port=?", peer_addr)
+
+    def set_offline(self, peer_addr: tuple[str, int]):
+        with self.conn:
+            self.conn.execute("UPDATE peer SET is_offline=TRUE where ip=? and port=?", peer_addr)
+
     def add_peer(self, peer_addr: tuple[str, int]):
+        if self.get_rows() > MAX_PEERS:
+            logging.debug(f"Already {MAX_PEERS} in database. Not inserting {peer_addr[0]}:{peer_addr[1]}")
+            return
+
         try:
             with self.conn:
                 cursor = self.conn.execute("INSERT OR IGNORE INTO peer (ip, port) VALUES (?, ?)", peer_addr)
@@ -283,9 +298,13 @@ class PeerManager:
         except sqlite3.Error as e:
             logging.critical(f"Error adding peer: {e}")
 
+    def get_rows(self) -> int:
+        with self.conn:
+            return self.conn.execute("SELECT COUNT(*) FROM peer").fetchone()[0]
+
     def get_peers(self, count: int, user_addr: Optional[tuple[str, int]]) -> list[tuple[str, int]]:
         with self.conn:
-            query = "SELECT ip, port FROM peer WHERE (ip != ? OR port != ?) ORDER BY RANDOM() LIMIT ?"
+            query = "SELECT ip, port FROM peer WHERE (ip != ? OR port != ?) and is_offline = FALSE ORDER BY RANDOM() LIMIT ?"
             user_ip, user_port = user_addr or ("", 0)
             result = self.conn.execute(query, (user_ip, user_port, count)).fetchall()
             return result
