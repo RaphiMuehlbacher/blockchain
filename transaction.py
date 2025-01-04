@@ -10,11 +10,12 @@ logger = setup_logger()
 
 
 class Transaction:
-    def __init__(self, receiver: str, amount: float, sender: Optional[str] = None, is_coinbase: bool = False, signature: Optional[str] = None, tx_hash: Optional[str] = None):
+    def __init__(self, receiver: str, amount: float, nonce: Optional[int] = 0, sender: Optional[str] = None, is_coinbase: bool = False, signature: Optional[str] = None, tx_hash: Optional[str] = None):
         self.is_coinbase = is_coinbase
         self.receiver = receiver
         self.amount = amount
         self.signature = signature
+        self.nonce = nonce
 
         if is_coinbase:
             self.sender = "COINBASE"
@@ -28,6 +29,7 @@ class Transaction:
             "sender": self.sender,
             "receiver": self.receiver,
             "amount": self.amount,
+            "nonce": self.nonce
         }, sort_keys=True)
 
         return hashlib.sha256(transaction_data.encode()).hexdigest()
@@ -42,7 +44,8 @@ class Transaction:
             "amount": self.amount,
             "is_coinbase": self.is_coinbase,
             "signature": self.signature,
-            "tx_hash": self.tx_hash
+            "tx_hash": self.tx_hash,
+            "nonce": self.nonce
         }
 
     def sign_transaction(self, private_key: SigningKey):

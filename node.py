@@ -29,7 +29,7 @@ class BaseNode:
         self.port = port
         self.host = "localhost"
         self.peer_manager = PeerManager()
-        self.blockchain = Blockchain(difficulty=5)
+        self.blockchain = Blockchain(difficulty=6)
 
     def start(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -209,6 +209,7 @@ class Node(BaseNode):
                     receiver=transaction_data["receiver"],
                     amount=float(transaction_data["amount"]),
                     sender=transaction_data["sender"],
+                    nonce=int(transaction_data["nonce"]),
                     is_coinbase=bool(transaction_data["is_coinbase"]),
                     signature=transaction_data["signature"],
                     tx_hash=transaction_data["tx_hash"]
@@ -288,7 +289,9 @@ class Node(BaseNode):
 
                 elif user_input.startswith("add_transaction"):
                     _, receiver, amount = user_input.split()
-                    transaction = Transaction(sender=self.private_key.get_verifying_key().to_string().hex(), receiver=receiver, amount=float(amount))
+                    public_key = self.private_key.get_verifying_key().to_string().hex()
+                    sender_nonce = self.blockchain.account_manager.get_nonce(public_key)
+                    transaction = Transaction(sender=public_key, receiver=receiver, amount=float(amount), nonce=sender_nonce)
                     transaction.sign_transaction(self.private_key)
 
                     if self.blockchain.add_transaction(transaction):
@@ -304,8 +307,12 @@ class Node(BaseNode):
                     transactions = [tx.to_dict() for tx in self.blockchain.pending_transactions]
                     print(json.dumps(transactions, indent=4, sort_keys=True))
 
+                elif user_input == "show_balance":
+                    balance = self.blockchain.account_manager.get_balance(self.private_key.get_verifying_key().to_string().hex())
+                    print(balance)
+
                 elif user_input == "help":
-                    logger.info("Available commands: peers, add_peer <ip:port>, health_check, add_transaction <receiver> exit")
+                    logger.info("Available commands: peers, add_peer <ip:port>, health_check, add_transaction <receiver> <amount>, exit, show_balance")
                 else:
                     logger.warning("Unknown command. Type 'help' for available commands.")
             except Exception as e:

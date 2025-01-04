@@ -1,7 +1,7 @@
 import json
 import sqlite3
 import time
-from decimal import getcontext, Decimal
+from decimal import Decimal
 
 from block import Block
 from transaction import Transaction
@@ -26,20 +26,25 @@ class Blockchain:
     def get_last_block(self) -> Block:
         return self.chain[-1]
 
-    def tx_in_mempool(self, transaction: Transaction) -> bool:
-        return transaction.tx_hash in {transaction.tx_hash for transaction in self.pending_transactions}
+    def tx_in_mempool(self, tx: Transaction) -> bool:
+        return tx.nonce in {transaction.nonce for transaction in self.pending_transactions if transaction.sender == tx.sender}
 
     def add_transaction(self, transaction: Transaction) -> bool:
-        if not transaction.is_valid() or self.tx_in_mempool(transaction):
+        if not transaction.is_valid():
             return False
 
         sender_balance = self.account_manager.get_balance(transaction.sender)
-        all_senders_spending = self.get_all_spendings_from_transactions(transaction.sender,
-                                                                        self.pending_transactions) + transaction.amount
-        if not sender_balance:
+        all_senders_spending = self.get_all_spendings_from_transactions(transaction.sender, self.pending_transactions) + transaction.amount
+        if sender_balance is None or sender_balance < all_senders_spending:
+            logger.debug(f"The transactions in the mempool are more than the balance from the sender. TX: {transaction}, sender_balance: {sender_balance}, total_spent: {all_senders_spending}")
             return False
-        if sender_balance < all_senders_spending:
+
+        sender_nonce = self.account_manager.get_nonce(transaction.sender)
+        if sender_nonce is None or transaction.nonce != sender_nonce:
+            logger.debug(f"Transaction nonce is less than the senders nonce. transaction_nonce: {transaction.nonce}, sender_nonce: {sender_nonce}")
             return False
+
+        self.account_manager.increment_nonce(transaction.sender)
 
         self.pending_transactions.append(transaction)
         return True
@@ -61,36 +66,67 @@ class Blockchain:
         return True
 
     def apply_transactions(self, transactions: list[Transaction]) -> bool:
+        transactions_by_sender = {}
+        coinbase_transactions = []
         for transaction in transactions:
             if transaction.sender == "COINBASE":
+                coinbase_transactions.append(transaction)
                 continue
 
-            amount_from_all_transactions = self.get_all_spendings_from_transactions(transaction.sender, transactions)
+            if transaction.sender not in transactions_by_sender:
+                transactions_by_sender[transaction.sender] = []
+            transactions_by_sender[transaction.sender].append(transaction)
 
-            sender_balance = self.account_manager.get_balance(transaction.sender)
-            if not sender_balance:
+        for sender, sender_transactions in transactions_by_sender.items():
+            sender_transactions.sort(key=lambda tx: tx.nonce)
+            current_nonce = self.account_manager.get_nonce(sender) - len(sender_transactions)
+            sender_balance = float(self.account_manager.get_balance(sender))
+
+            if sender_balance is None:
+                logger.warning(f"The sender_balance is None. sender: {sender}")
                 return False
 
-            new_balance = sender_balance - amount_from_all_transactions
-            if new_balance < 0:
+            total_spent = 0.0
+
+            for transaction in sender_transactions:
+                if transaction.nonce != current_nonce:
+                    logger.info(f"Transaction nonce is not the same as the current_nonce. transaction_nonce: {transaction.nonce}, current_nonce: {current_nonce}")
+                    return False
+
+                total_spent += transaction.amount
+                current_nonce += 1
+
+            if total_spent > sender_balance:
+                logger.info(f"Total spent is more than sender_balance. total_spent: {total_spent}, sender_balance: {sender_balance}")
                 return False
 
-        for transaction in transactions:
-            if not transaction.sender == "COINBASE":
-                sender_balance = self.account_manager.get_balance(transaction.sender)
-                self.account_manager.upsert_balance(transaction.sender, sender_balance - transaction.amount)
+            for transaction in sender_transactions:
+                current_balance = self.account_manager.get_balance(sender)
+                transaction_amount = Decimal(transaction.amount).quantize(Decimal("0.0000001"))
+                new_balance = (current_balance - transaction_amount).quantize(Decimal("0.0000001"))
 
-            receiver_balance = self.account_manager.get_balance(transaction.receiver) or 0
-            self.account_manager.upsert_balance(transaction.receiver, receiver_balance + transaction.amount)
+                self.account_manager.upsert_balance(transaction.sender, new_balance)
+                self.account_manager.increment_nonce(transaction.sender)
+
+                receiver_balance = self.account_manager.get_balance(transaction.receiver) or Decimal(0).quantize(Decimal("0.0000001"))
+                new_receiver_balance = (receiver_balance + transaction_amount).quantize(Decimal("0.0000001"))
+                self.account_manager.upsert_balance(transaction.receiver, new_receiver_balance)
+
+        if len(coinbase_transactions) != 1:
+            logger.warning(f"There are {len(coinbase_transactions)} coinbase transactions.")
+        coinbase_transaction = coinbase_transactions[0]
+        receiver_balance = self.account_manager.get_balance(coinbase_transaction.receiver) or Decimal(0).quantize(Decimal("0.0000001"))
+        new_receiver_balance = (receiver_balance + Decimal(10.0).quantize(Decimal("0.0000001"))).quantize(Decimal("0.0000001"))
+        self.account_manager.upsert_balance(coinbase_transaction.receiver, new_receiver_balance)
         return True
 
     @staticmethod
     def get_all_spendings_from_transactions(sender: str, transactions: list[Transaction]) -> float:
-        amount = 0
-        for transaction in transactions:
-            if transaction.sender == sender:
-                amount += transaction.amount
-        return amount
+        return sum(transaction.amount for transaction in transactions if transaction.sender == sender)
+
+    @staticmethod
+    def get_all_transactions_from_sender(sender: str, transactions: list[Transaction]) -> list[Transaction]:
+        return [transaction for transaction in transactions if transaction.sender == sender]
 
     def mine_pending_transactions(self, miner_address: str) -> Block | None:
         reward_transaction = Transaction(receiver=miner_address, amount=10.0, is_coinbase=True)
@@ -144,7 +180,6 @@ class AccountManager:
         self.database_path = get_database_path()
         self.create_account_table()
         self.set_initial_balance()
-        getcontext().prec = 10
 
     def get_connection(self) -> sqlite3.Connection:
         return sqlite3.connect(self.database_path, check_same_thread=False)
@@ -155,6 +190,7 @@ class AccountManager:
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS account (
                         public_key TEXT PRIMARY KEY,
+                        nonce INTEGER DEFAULT 0,
                         balance INTEGER DEFAULT 0
                     )
                 """)
@@ -174,8 +210,8 @@ class AccountManager:
         except sqlite3.Error as e:
             logger.critical(f"Error setting initial balance: {e}")
 
-    def upsert_balance(self, public_key: str, balance: float = 10) -> None:
-        smallest_unit_balance = int(Decimal(balance) * Decimal(1e6))
+    def upsert_balance(self, public_key: str, balance: Decimal) -> None:
+        smallest_unit_balance = int((Decimal(balance) * Decimal(1e6)).quantize(Decimal("0.0000001")))
         try:
             with self.get_connection() as conn:
                 conn.execute("""
@@ -188,12 +224,29 @@ class AccountManager:
         except sqlite3.Error as e:
             logger.critical(f"Error adding an account: {e}")
 
-    def get_balance(self, public_key: str) -> float | None:
+    def get_balance(self, public_key: str) -> Decimal | None:
         try:
             with self.get_connection() as conn:
                 result = conn.execute("SELECT balance FROM account WHERE public_key=?", (public_key,)).fetchone()
                 if result is not None:
-                    return float(Decimal(result[0]) / Decimal(1e6))
+                    return (Decimal(result[0]) / Decimal(1e6)).quantize(Decimal("0.0000001"))
                 return None
         except sqlite3.Error as e:
             logger.critical(f"Error getting the balance from {public_key}, Error: {e}")
+
+    def get_nonce(self, public_key: str) -> int | None:
+        try:
+            with self.get_connection() as conn:
+                result = conn.execute("SELECT nonce FROM account WHERE public_key=?", (public_key,)).fetchone()
+                if result is not None:
+                    return result[0]
+                return None
+        except sqlite3.Error as e:
+            logger.critical(f"Error getting the nonce from {public_key}, Error: {e}")
+
+    def increment_nonce(self, public_key: str) -> None:
+        try:
+            with self.get_connection() as conn:
+                conn.execute("UPDATE account SET nonce = nonce + 1 WHERE public_key=?", (public_key,))
+        except sqlite3.Error as e:
+            logger.critical(f"Error incrementing the nonce from {public_key}, Error: {e}")
