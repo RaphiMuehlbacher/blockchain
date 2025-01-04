@@ -3,6 +3,7 @@ import hashlib
 from typing import Optional
 
 from ecdsa import VerifyingKey, SECP256k1, BadSignatureError, SigningKey
+
 from utils import setup_logger
 
 logger = setup_logger()

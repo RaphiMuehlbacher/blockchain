@@ -2,7 +2,7 @@ import logging
 import os
 
 
-def setup_logger():
+def setup_logger() -> logging.Logger:
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
 
@@ -22,3 +22,9 @@ def setup_logger():
         logger.addHandler(console_handler)
 
     return logger
+
+
+def get_database_path() -> str:
+    current_folder = os.path.dirname(os.path.abspath(__file__))
+    database_path = os.path.join(current_folder, "blockchain.db")
+    return database_path

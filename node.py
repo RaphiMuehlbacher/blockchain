@@ -13,7 +13,7 @@ from typing_extensions import Optional
 from block import Block
 from blockchain import Blockchain
 from transaction import Transaction
-from utils import setup_logger
+from utils import setup_logger, get_database_path
 
 logger = setup_logger()
 
@@ -29,7 +29,7 @@ class BaseNode:
         self.port = port
         self.host = "localhost"
         self.peer_manager = PeerManager()
-        self.blockchain = Blockchain(difficulty=6)
+        self.blockchain = Blockchain(difficulty=5)
 
     def start(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -246,16 +246,12 @@ class Node(BaseNode):
                 self.broadcast(message)
 
     def broadcast(self, message: dict):
-        logger.info(f"Starting broadcasting this message: {message}")
-
         def send_message_to_peer(peer):
             try:
                 serialized_message = json.dumps(message).encode()
                 length_prefix = len(serialized_message).to_bytes(4, "big")
-                logger.info(f"Creating connection to {peer}...")
                 with socket.create_connection(peer, timeout=10) as conn:
                     conn.sendall(length_prefix + serialized_message)
-                    logger.info(f"Finished sending message to {peer}")
             except Exception as e:
                 logger.warning(f"Error notifying peer {peer}: {e}", exc_info=True)
                 self.peer_manager.remove_peer(peer)
@@ -264,8 +260,6 @@ class Node(BaseNode):
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(peers)) as executor:
             futures = [executor.submit(send_message_to_peer, peer) for peer in peers]
             concurrent.futures.wait(futures)
-
-        logger.info("Broadcasting completed.")
 
     def handle_user_input(self):
         while True:
@@ -397,20 +391,13 @@ class Node(BaseNode):
 
 class PeerManager:
     def __init__(self):
-        self.database_path = self.get_database_path()
-        self.create_table()
-
-    @staticmethod
-    def get_database_path() -> str:
-        current_folder = os.path.dirname(os.path.abspath(__file__))
-        database_path = os.path.join(current_folder, "blockchain.db")
-        logger.debug(f"Using database at: {database_path}")
-        return database_path
+        self.database_path = get_database_path()
+        self.create_peer_table()
 
     def get_connection(self) -> sqlite3.Connection:
         return sqlite3.connect(self.database_path, check_same_thread=False)
 
-    def create_table(self):
+    def create_peer_table(self):
         try:
             with self.get_connection() as conn:
                 conn.execute("""
@@ -444,7 +431,6 @@ class PeerManager:
 
     def add_peer(self, peer_addr: tuple[str, int], max_peers: Optional[int]):
         current_rows = self.get_rows()
-        logger.debug(f"Trying to add peer: {peer_addr[0]}:{peer_addr[1]}, rows: {current_rows}, max_peers: {max_peers} ")
 
         if max_peers is not None and self.get_rows() > max_peers:
             logger.debug(f"Already {max_peers} in database. Not inserting {peer_addr[0]}:{peer_addr[1]}")
